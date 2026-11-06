@@ -298,7 +298,7 @@ class _LivePageState extends State<LivePage> {
       );
     }
     return GridView.builder(
-      padding: EdgeInsets.fromLTRB(16, 12, 16, 24 + bottomInset),
+      padding: EdgeInsets.fromLTRB(16, 12, 16, 24 + widget.bottomInset),
       gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
         maxCrossAxisExtent: 220,
         mainAxisExtent: 64,
