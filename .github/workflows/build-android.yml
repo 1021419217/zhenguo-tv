@@ -1,0 +1,113 @@
+name: Build Android APK
+
+# 精简版 Android 出包工作流：只在 Ubuntu 云主机上编译 APK 并上传 artifact。
+# 与完整版 build.yml 不同，这里不跑 Windows/macOS/iOS，也不触发 Release 发布，
+# 只出「真果鉴（含全部站源）」一个版本，省时间省 runner 分钟。
+# 未配置签名 secrets 时用 debug 签名（Flutter 固定 debug.keystore，可正常安装与覆盖升级）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      all_abis:
+        description: '出全部 3 个 ABI（arm64-v8a + armeabi-v7a + x86_64）；不勾只出 arm64-v8a（主流手机）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-36"
+          accept-android-sdk-licenses: true
+
+      - name: Install Android NDK
+        run: sdkmanager 'ndk;28.2.13676358'
+
+      - name: Configure Android signing
+        id: signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::warning::未配置 Android 签名 Secrets，本次使用 debug 签名出包。"
+            echo "mode=debug" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! printf '%s' "$ANDROID_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$RUNNER_TEMP/release.jks" 2>/dev/null; then
+            echo "ANDROID_KEYSTORE_BASE64 不是合法 base64。" >&2
+            exit 1
+          fi
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          echo "mode=release" >> "$GITHUB_OUTPUT"
+
+      # 番茄引擎只影响「番茄」站源，与 78 个 seku 影视站源无关；失败不拦出包。
+      - name: 编译安卓番茄引擎（补齐缺失 ABI）
+        continue-on-error: true
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          python scripts/build_fanqie_engine.py --android \
+            --out android/app/src/main/jniLibs --android-skip-existing
+          ls -l android/app/src/main/jniLibs/*/libfanqie_shim.so || true
+
+      - name: Build APK（全剧TV · 含全部站源）
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ "${{ inputs.all_abis }}" = "true" ]; then
+            python scripts/build_android.py --all-sources
+          else
+            python scripts/build_android.py --all-sources --abi arm64-v8a
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/android/*
+          if-no-files-found: error
+          retention-days: 14

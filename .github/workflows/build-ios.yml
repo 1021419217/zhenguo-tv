@@ -1,0 +1,104 @@
+name: Build iOS unsigned IPA
+
+# 精简版 iOS 出包工作流：只在 macOS 云主机上编译 unsigned IPA 并上传 artifact，
+# 供你下载后用 Sideloadly / AltStore 免费自签安装（7 天有效期）。
+# 不依赖任何 secrets，不触发 Release 发布。
+
+on:
+  workflow_dispatch:
+    inputs:
+      full_variants:
+        description: '出两个版本（红果鉴+真果鉴）；不勾只出真果鉴（含全部站源，省一半 macOS 计费分钟）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  build-ios:
+    # macOS runner 分钟数按 10 倍计费：Free 计划每月约 200 macOS 分钟，
+    # 单次真果鉴构建约 20 分钟墙钟（200 账单分钟），一个月 Free 额度只够一次。
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+
+      - name: Check Xcode and CocoaPods
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --find clang
+          if ! command -v pod >/dev/null 2>&1; then
+            brew install cocoapods
+          fi
+          pod --version
+          go version
+          flutter --version
+          flutter precache --ios
+
+      - name: Flutter pub get
+        run: flutter pub get --enforce-lockfile
+
+      # 番茄引擎只影响「番茄」站源，与 78 个 seku 影视站源无关；
+      # 失败不拦出包（FanqieEngine.podspec 会跳过链接）。
+      - name: 编译番茄引擎静态库（iOS，失败不拦出包）
+        continue-on-error: true
+        run: |
+          rustup target add aarch64-apple-ios
+          python scripts/build_fanqie_engine.py --out ios/FanqieEngine --target aarch64-apple-ios
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: ios/Pods
+          key: pods-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ios/Podfile', '.flutter-plugins-dependencies') }}
+          restore-keys: |
+            pods-${{ runner.os }}-${{ runner.arch }}-
+
+      # 真果鉴（--all-sources）= 全源版，含移植进来的 78 个影视站源，必出。
+      - name: Build unsigned IPA（真果鉴 · 含全部站源）
+        run: python scripts/build_ios.py --all-sources
+
+      # 红果鉴 = 仅红果+番茄的精简版，可选，省计费分钟默认不勾。
+      - name: Build unsigned IPA（红果鉴，可选）
+        if: ${{ inputs.full_variants }}
+        run: python scripts/build_ios.py
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned
+          path: dist/ios/*
+          if-no-files-found: error
+          retention-days: 14

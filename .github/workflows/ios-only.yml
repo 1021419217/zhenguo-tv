@@ -1,0 +1,113 @@
+name: Build 真果TV iOS IPA
+
+# 真果TV iOS 未签名出包工作流（非 fork 仓库 / macos-latest）。
+# 每次触发默认把版本号 +0.1 并回写仓库；首次发版保持 1.0.0 时关闭 bump_version 输入。
+# 不含 concurrency 段：避免同账号多个 macOS 构建排队时相互 cancel。
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_version:
+        description: '自动把版本号 +0.1（1.0.0 → 1.1.0）并回写仓库；首次发版保持 1.0.0 请关闭'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  build-ios:
+    name: Build unsigned iOS IPA (真果TV)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 自动递增版本号 (+0.1)
+        if: ${{ inputs.bump_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          new_version="$(python3 scripts/bump_version.py)"
+          echo "本次构建版本: $new_version" >> "$GITHUB_STEP_SUMMARY"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pubspec.yaml
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: 版本号自动递增到 $new_version [skip ci]"
+            git push origin HEAD:main
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+
+      - name: Check Xcode and CocoaPods
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --find clang
+          if ! command -v pod >/dev/null 2>&1; then brew install cocoapods; fi
+          pod --version
+          go version
+          flutter --version
+          flutter precache --ios
+
+      - name: Flutter pub get
+        run: flutter pub get --enforce-lockfile
+
+      # 诊断步骤：把 Dart 静态分析的全部问题直接打印出来（不阻断），
+      # 便于构建失败时第一时间定位，而不用去翻被 Flutter 吞掉的 xcodebuild 输出。
+      - name: 诊断 Dart 静态分析
+        shell: bash
+        run: |
+          flutter analyze --no-pub 2>&1 | tee /tmp/analyze.log || true
+          echo "=== ANALYZE_DIAG_DONE ==="
+
+      # 番茄引擎只影响「番茄」站源，失败不拦出包。
+      - name: 编译番茄引擎静态库（iOS，失败不拦出包）
+        continue-on-error: true
+        run: |
+          rustup target add aarch64-apple-ios
+          python scripts/build_fanqie_engine.py --out ios/FanqieEngine --target aarch64-apple-ios
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: ios/Pods
+          key: pods-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ios/Podfile', '.flutter-plugins-dependencies') }}
+          restore-keys: |
+            pods-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build unsigned IPA (真果TV · 含全部站源)
+        run: python scripts/build_ios.py --all-sources
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-unsigned
+          path: dist/ios/*
+          if-no-files-found: error
+          retention-days: 14
